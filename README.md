@@ -8,9 +8,10 @@ stated up front, every step verified with a real command, every failure document
 as it happened rather than smoothed over.
 
 **What this is:** VMware Workstation running nested ESXi 8.0U3e (free license) on a
-single Windows machine, with two VMs, a `govc`-based inventory layer, and an Ansible
-playbook that installs monitoring and a Python health-check tool with real
-verification, not just "task completed."
+single Windows machine, with two VMs, a `govc`-based inventory layer, and Ansible
+playbooks that deploy a real Prometheus + Grafana monitoring stack and a Python
+health-check tool — both with real verification, not just "task completed," and
+the health-check proven against an actual injected failure, not just deployed.
 
 **What this is not:** a vCenter environment. That distinction turned out to matter a
 lot — see [Findings](#findings-the-real-material-here) below.
@@ -111,6 +112,9 @@ This project's value is mostly in what it found, not in a clean happy path.
 | 11 | Ansible's generic `package` module on Photon OS | Failed to find `dnf` python bindings | Auto-detection guessed `dnf`; Photon uses `tdnf`, not compatible with the same bindings |
 | 12 | `ansible.builtin.user` creating a system user, expecting a same-named group | `chgrp failed: failed to look up group node_exporter` | Photon's `useradd` doesn't create a matching private group automatically |
 | 13 | Health-check script reporting `sshd: inactive` on a host we were actively SSH'd into | Looked like a false alarm; wasn't | This host uses **socket-activated SSH** (`sshd.socket`); the persistent-daemon unit is legitimately idle by design |
+| 14 | Prometheus scraping `node_exporter` across VMs, after it had passed its own local health check for days | `context deadline exceeded` — a silent timeout, not a refusal | Photon's default firewall (`policy DROP` on `INPUT`) only ever allowed loopback, established connections and SSH; the service was healthy the whole time, nothing outside the VM could ever reach it |
+| 15 | The same firewall, checked on `ansible-control` before opening Grafana's port to a browser | Identical default-deny policy | Same base OVA image — the fix (and the habit of checking first) applied to both VMs |
+| 16 | Ansible's `uri` module with credentials embedded in the URL (`http://admin:admin@host/...`) | 401 Unauthorized, even though the credentials were correct | Confirmed with a direct `curl -u admin:admin` against the same endpoint (200, correct data) — the module needs `url_username`/`url_password` explicitly, not URL-embedded auth |
 
 Three of the four VM-management API failures (#4, #5, #6, #7) produced the *exact
 same* error string, which is what makes this a confirmed, general license
@@ -139,7 +143,7 @@ restriction rather than four unrelated bugs.
 5. **Verifies its own work**: checks `node_exporter`'s `/metrics` endpoint actually
    returns HTTP 200, and asserts the result rather than trusting "changed".
 
-Confirmed fully idempotent: a second run reports `changed=0` across all 22 tasks.
+Confirmed fully idempotent: a second run reports `changed=0` across all tasks.
 
 Sample health-check output, read live from the running VM:
 
@@ -154,6 +158,55 @@ Sample health-check output, read live from the running VM:
   "healthy": true
 }
 ```
+
+### Monitoring drill 001: proving the monitoring actually detects a failure
+
+`node_exporter` and the health-check timer existed but had never been proven to
+catch a real failure. This drill closed that gap: target committed *before*
+running it, same discipline as the Azure and AWS drills elsewhere in this
+portfolio.
+
+| | Target | Measured | Result |
+|---|---|---|---|
+| Detection time for a stopped `node_exporter` | ≤ 6 minutes | **4 minutes 23 seconds** | **Met** |
+
+Full timeline, the raw JSON the tool actually produced, and the caveats (one
+failure mode tested; disk/memory have no threshold alerting yet) are in
+[`docs/monitoring-drill-001-results.md`](docs/monitoring-drill-001-results.md).
+
+## The monitoring stack: Prometheus + Grafana
+
+`ansible/monitoring-stack.yml`, run on `ansible-control` itself (`hosts:
+monitoring`, `ansible_connection=local` — this manages the control node's own
+software, not `photon-template`, so there's no SSH hop for it):
+
+1. **Prometheus** (checksum-verified download), scraping `node_exporter` on
+   `photon-template` every 15 seconds.
+2. **Grafana** (rpm, checksum self-recorded — see caveat below), with its
+   Prometheus datasource **provisioned as code**, not clicked through in the UI.
+3. **A real dashboard**, also provisioned as code
+   (`ansible/files/photon-template-dashboard.json`): node up/down, CPU busy %,
+   memory used %, disk used %, and load average — reading the exact same
+   `node_exporter` metrics the health-check drill above exercises.
+4. **Verifies its own work**: confirms Prometheus actually reports the target
+   `up` (not just "service running"), confirms Grafana's health endpoint, and
+   confirms the dashboard is actually loaded via Grafana's own API, not just
+   that the JSON file was copied into place.
+
+**View it:** `http://<ansible-control-ip>:3000`, login `admin` / `admin`.
+
+**Caveats, stated plainly:**
+- **Grafana's rpm checksum is self-recorded, not independently cross-checked** —
+  GitHub's release for this asset didn't publish a separate checksums file the
+  way Prometheus and `node_exporter` do. Pinned from the exact bytes downloaded
+  on 2026-09-30, verified on every subsequent run, but not verified against a
+  second independent source at the time of first download.
+- **`admin`/`admin` is Grafana's real, unchanged default** — a deliberate choice
+  for a disposable, NAT-isolated lab with no other credential-management need,
+  not something to carry into anything real.
+- **Both VMs needed a firewall rule opened** (finding #14/#15) before either
+  Prometheus or a browser could reach anything beyond SSH — the same default-deny
+  policy exists on both, since they're the same base image.
 
 ## What this does not show
 
@@ -206,12 +259,17 @@ ssh root@<control-vm> "cd ~/ansible && ansible-playbook -i inventory.ini operati
 ```
 vmware-provisioning-lab/
 ├── README.md                 you are here
+├── docs/
+│   ├── monitoring-drill-001-target.md    committed before the drill ran
+│   └── monitoring-drill-001-results.md   4m23s detection, target met
 ├── ansible/
-│   ├── inventory.ini
+│   ├── inventory.ini          [managed] = photon-template; [monitoring] = ansible-control (local)
 │   ├── ping.yml               the first, minimal connectivity check
-│   ├── operational-baseline.yml   the real playbook: users, SSH hardening,
-│   │                               node_exporter, health-check, verification
-│   └── files/                templates and static files the playbook deploys
+│   ├── operational-baseline.yml   users, SSH hardening, node_exporter, health-check,
+│   │                               the firewall fix, verification
+│   ├── monitoring-stack.yml   Prometheus + Grafana on ansible-control, provisioned
+│   │                          datasource and dashboard, verification
+│   └── files/                templates, systemd units and the dashboard JSON
 ├── terraform/                 the vsphere-provider attempt: works for read-only
 │   │                           data sources, crashes on the VM data source
 │   └── clone.tf, main.tf, variables.tf, versions.tf, outputs.tf

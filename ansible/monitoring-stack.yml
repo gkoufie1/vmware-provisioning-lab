@@ -1,0 +1,258 @@
+---
+# Prometheus + Grafana, running on ansible-control itself (the tooling VM, not
+# the managed node), scraping node_exporter on photon-template and showing it
+# as a real dashboard instead of raw JSON/metrics text. Runs locally via the
+# [monitoring] inventory group (ansible_connection=local) — this stack manages
+# the control node's own software, so there's no SSH hop for these tasks.
+
+- name: Monitoring stack (Prometheus + Grafana)
+  hosts: monitoring
+  become: true
+  vars:
+    managed_host_ip: 192.168.65.129
+    node_exporter_port: 9100
+    prometheus_version: "3.15.0"
+    prometheus_sha256: "2a542df32eac02ee17b9d844fb2aa1de00dafa5476579ba8a3ba862e9d572ea0"
+    grafana_version: "13.2.3"
+    grafana_build: "36482603486"
+    # Self-recorded at download time (2026-09-30) — Grafana's GitHub release
+    # for this asset did not publish an independent checksums file the way
+    # Prometheus and node_exporter do, so this pins the exact bytes observed
+    # then, rather than cross-verifying against a second published source.
+    grafana_rpm_sha256: "4fc2adc0912421b630696423d5c05ee2df560347fdb5e906a927fffc3201d066"
+    grafana_port: 3000
+    # Same discovery as operational-baseline.yml's node_exporter firewall fix:
+    # this VM is the same base image with the same default-deny INPUT policy.
+    # Scoped to the lab's own NAT subnet, not 0.0.0.0/0 — it's not pinned to
+    # one host address because Workstation's NAT gateway (.2) isn't
+    # necessarily the same address the host's own browser traffic uses.
+    lab_subnet: "192.168.65.0/24"
+
+  tasks:
+    # --- Prometheus ---
+    - name: Prometheus system group exists
+      ansible.builtin.group:
+        name: prometheus
+        system: true
+
+    - name: Prometheus system user exists, no login
+      ansible.builtin.user:
+        name: prometheus
+        group: prometheus
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Download Prometheus, checksum-verified
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+        checksum: "sha256:{{ prometheus_sha256 }}"
+        mode: "0644"
+
+    - name: Check whether tar is already installed
+      ansible.builtin.command: which tar
+      register: tar_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install tar via tdnf
+      ansible.builtin.command: tdnf install -y tar
+      when: tar_check.rc != 0
+
+    - name: Extract Prometheus
+      ansible.builtin.unarchive:
+        src: "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/prometheus"
+
+    - name: Install the prometheus and promtool binaries
+      ansible.builtin.copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+        owner: prometheus
+        group: prometheus
+      loop:
+        - prometheus
+        - promtool
+
+    - name: Prometheus config and data directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: "0755"
+      loop:
+        - /etc/prometheus
+        - /var/lib/prometheus
+
+    - name: Prometheus scrape config — targets node_exporter on photon-template
+      ansible.builtin.template:
+        src: files/prometheus.yml.j2
+        dest: /etc/prometheus/prometheus.yml
+        owner: prometheus
+        group: prometheus
+        mode: "0644"
+      notify: Restart prometheus
+
+    - name: Prometheus systemd unit
+      ansible.builtin.template:
+        src: files/prometheus.service.j2
+        dest: /etc/systemd/system/prometheus.service
+        mode: "0644"
+      notify: Reload systemd and restart prometheus
+
+    - name: Prometheus is enabled and running
+      ansible.builtin.systemd:
+        name: prometheus
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # --- Grafana ---
+    - name: Download Grafana rpm, checksum-verified
+      ansible.builtin.get_url:
+        url: "https://github.com/grafana/grafana/releases/download/v{{ grafana_version }}/grafana_{{ grafana_version }}_{{ grafana_build }}_linux_amd64.rpm"
+        dest: "/tmp/grafana-{{ grafana_version }}.rpm"
+        checksum: "sha256:{{ grafana_rpm_sha256 }}"
+        mode: "0644"
+
+    - name: Check whether Grafana is already installed
+      ansible.builtin.command: rpm -q grafana
+      register: grafana_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Grafana via rpm
+      ansible.builtin.command: "rpm -ivh /tmp/grafana-{{ grafana_version }}.rpm"
+      when: grafana_check.rc != 0
+
+    - name: Grafana provisioning directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: grafana
+        group: grafana
+        mode: "0755"
+      loop:
+        - /etc/grafana/provisioning/datasources
+        - /etc/grafana/provisioning/dashboards
+        - /etc/grafana/provisioning/dashboards/json
+
+    - name: Prometheus datasource is provisioned (no manual UI setup)
+      ansible.builtin.copy:
+        src: files/grafana-datasource.yml
+        dest: /etc/grafana/provisioning/datasources/prometheus.yml
+        owner: grafana
+        group: grafana
+        mode: "0644"
+      notify: Restart grafana-server
+
+    - name: Dashboard provider is configured
+      ansible.builtin.copy:
+        src: files/grafana-dashboard-provider.yml
+        dest: /etc/grafana/provisioning/dashboards/vmware-lab.yml
+        owner: grafana
+        group: grafana
+        mode: "0644"
+      notify: Restart grafana-server
+
+    - name: The host-overview dashboard itself is provisioned
+      ansible.builtin.copy:
+        src: files/photon-template-dashboard.json
+        dest: /etc/grafana/provisioning/dashboards/json/photon-template-dashboard.json
+        owner: grafana
+        group: grafana
+        mode: "0644"
+      notify: Restart grafana-server
+
+    - name: grafana-server is enabled and running
+      ansible.builtin.systemd:
+        name: grafana-server
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # --- Firewall: same default-deny discovery as photon-template ---
+    - name: Grafana's port is allowed through the firewall for the lab subnet
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/scripts/ip4save
+        insertafter: '^-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT'
+        line: "-A INPUT -p tcp -s {{ lab_subnet }} -m tcp --dport {{ grafana_port }} -j ACCEPT"
+      notify: Reload firewall rules
+
+    # --- Verify, don't just trust "changed" ---
+    - name: Give Prometheus a moment to complete its first scrape
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Ask Prometheus whether it considers node_exporter up
+      ansible.builtin.uri:
+        url: "http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22node_exporter%22%7D"
+        return_content: true
+      register: prom_query
+
+    - name: Fail loudly if Prometheus isn't actually scraping node_exporter
+      ansible.builtin.assert:
+        that:
+          - prom_query.json.data.result | length > 0
+          - prom_query.json.data.result[0].value[1] == "1"
+        fail_msg: "Prometheus is running but does not report node_exporter as up — the dashboard would be showing stale or no data."
+
+    - name: Grafana's own health endpoint
+      ansible.builtin.uri:
+        url: "http://localhost:3000/api/health"
+        return_content: true
+      register: grafana_health
+
+    - name: Fail loudly if Grafana isn't actually healthy
+      ansible.builtin.assert:
+        that:
+          - grafana_health.json.database == "ok"
+        fail_msg: "Grafana is running but its own health check does not report database: ok."
+
+    - name: Confirm the dashboard was actually provisioned (not just the file copied)
+      ansible.builtin.uri:
+        url: "http://localhost:3000/api/dashboards/uid/photon-template-overview"
+        # Ansible's uri module doesn't reliably handle credentials embedded in
+        # the URL string itself (confirmed: curl -u admin:admin against the
+        # same endpoint returns 200 with the real dashboard; the embedded-URL
+        # form returned 401) — url_username/url_password is the form that
+        # actually works.
+        url_username: admin
+        url_password: admin
+        force_basic_auth: true
+        return_content: true
+      register: dashboard_check
+
+    - name: Fail loudly if Grafana didn't pick up the provisioned dashboard
+      ansible.builtin.assert:
+        that:
+          - dashboard_check.json.dashboard.title == "photon-template — host overview"
+        fail_msg: "The dashboard JSON was copied into place, but Grafana's API does not report it loaded."
+
+  handlers:
+    - name: Reload firewall rules
+      ansible.builtin.systemd:
+        name: iptables
+        state: restarted
+
+    - name: Restart prometheus
+      ansible.builtin.systemd:
+        name: prometheus
+        state: restarted
+
+    - name: Reload systemd and restart prometheus
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: prometheus
+        state: restarted
+
+    - name: Restart grafana-server
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted
