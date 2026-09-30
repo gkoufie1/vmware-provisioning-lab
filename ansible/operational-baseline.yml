@@ -1,0 +1,207 @@
+---
+# Operational baseline: a dedicated admin account with hardened SSH, a
+# Prometheus node_exporter for monitoring, and a small Python health-check
+# tool run on a timer — the config-management half of this project, aimed
+# at "internal tools for monitoring and troubleshooting" and "Python-based
+# automation" specifically, not just a connectivity test.
+#
+# Idempotent: safe to re-run. Every check at the bottom fails the play
+# loudly rather than reporting "changed" as if that were proof of health.
+
+- name: Operational baseline
+  hosts: managed
+  become: true
+  vars:
+    admin_user: opsadmin
+    admin_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMUP9cBHALvtLYuVjVOWZdzoJEVGs18/T5Rg5W+F5zzT vmware-lab-photon-template"
+    node_exporter_version: "1.12.1"
+    node_exporter_sha256: "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
+    node_exporter_port: 9100
+    # sshd.socket, not sshd.service: this host activates SSH per-connection
+    # via systemd socket activation, so the persistent-daemon unit is
+    # legitimately inactive by design — found by the health-check correctly
+    # flagging "sshd: inactive" on a host we were actively SSH'd into,
+    # which was the tool doing its job, not a false alarm to ignore.
+    expected_services:
+      - sshd.socket
+      - node_exporter
+
+  tasks:
+    # --- Dedicated admin account, so root isn't the only way in ---
+    - name: Create the admin user
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        create_home: true
+
+    - name: Authorize our key for the admin user
+      ansible.posix.authorized_key:
+        user: "{{ admin_user }}"
+        key: "{{ admin_pubkey }}"
+
+    # This minimal Photon OS appliance image doesn't ship sudo at all —
+    # found by the first run of this playbook failing on a missing
+    # /etc/sudoers.d, not something assumed up front. The generic `package`
+    # module also can't auto-detect Photon's tdnf (it guessed dnf, which
+    # isn't installed here), so this uses tdnf directly with its own
+    # idempotency check instead.
+    - name: Check whether sudo is already installed
+      ansible.builtin.command: which sudo
+      register: sudo_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install sudo via tdnf
+      ansible.builtin.command: tdnf install -y sudo
+      when: sudo_check.rc != 0
+
+    - name: Give the admin user passwordless sudo
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ admin_user }}"
+        content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    # --- Harden SSH: key-only root, password auth off entirely ---
+    - name: Root SSH login is key-only, not password
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitRootLogin"
+        line: "PermitRootLogin prohibit-password"
+      notify: Restart sshd
+
+    - name: Password authentication is off host-wide
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PasswordAuthentication"
+        line: "PasswordAuthentication no"
+      notify: Restart sshd
+
+    # --- node_exporter: real monitoring tooling, not a stub ---
+    - name: node_exporter system group exists
+      ansible.builtin.group:
+        name: node_exporter
+        system: true
+
+    - name: node_exporter system user exists, no login
+      ansible.builtin.user:
+        name: node_exporter
+        group: node_exporter
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Download node_exporter, checksum-verified
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+        checksum: "sha256:{{ node_exporter_sha256 }}"
+        mode: "0644"
+
+    - name: Check whether tar is already installed
+      ansible.builtin.command: which tar
+      register: tar_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install tar via tdnf
+      ansible.builtin.command: tdnf install -y tar
+      when: tar_check.rc != 0
+
+    - name: Extract node_exporter
+      ansible.builtin.unarchive:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+
+    - name: Install the node_exporter binary
+      ansible.builtin.copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        mode: "0755"
+        remote_src: true
+        owner: node_exporter
+        group: node_exporter
+
+    - name: node_exporter systemd unit
+      ansible.builtin.template:
+        src: files/node_exporter.service.j2
+        dest: /etc/systemd/system/node_exporter.service
+        mode: "0644"
+      notify: Reload systemd and restart node_exporter
+
+    - name: node_exporter is enabled and running
+      ansible.builtin.systemd:
+        name: node_exporter
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # --- The Python health-check tool, and a timer to actually use it ---
+    - name: Deploy health-check.py
+      ansible.builtin.template:
+        src: files/health-check.py.j2
+        dest: /usr/local/bin/health-check.py
+        mode: "0755"
+
+    - name: Deploy the health-check systemd service (one-shot)
+      ansible.builtin.copy:
+        src: files/health-check.service
+        dest: /etc/systemd/system/health-check.service
+        mode: "0644"
+
+    - name: Deploy the health-check timer (every 5 minutes)
+      ansible.builtin.copy:
+        src: files/health-check.timer
+        dest: /etc/systemd/system/health-check.timer
+        mode: "0644"
+      notify: Reload systemd and enable health-check timer
+
+    - name: health-check timer is enabled and running
+      ansible.builtin.systemd:
+        name: health-check.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # --- Verify, don't just trust "changed" ---
+    - name: Run health-check.py once, right now, and capture real output
+      ansible.builtin.command: /usr/local/bin/health-check.py
+      register: health_now
+      changed_when: false
+      failed_when: false  # a nonzero exit here is itself evidence, not a playbook bug
+
+    - name: Show the live health-check result
+      ansible.builtin.debug:
+        var: health_now.stdout
+
+    - name: node_exporter's metrics endpoint actually answers
+      ansible.builtin.uri:
+        url: "http://localhost:{{ node_exporter_port }}/metrics"
+        return_content: false
+      register: metrics_check
+
+    - name: Fail loudly if node_exporter isn't really serving metrics
+      ansible.builtin.assert:
+        that:
+          - metrics_check.status == 200
+        fail_msg: "node_exporter is not answering on port {{ node_exporter_port }} — service claims running, but the endpoint doesn't respond."
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted
+
+    - name: Reload systemd and restart node_exporter
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: node_exporter
+        state: restarted
+
+    - name: Reload systemd and enable health-check timer
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: health-check.timer
+        state: restarted

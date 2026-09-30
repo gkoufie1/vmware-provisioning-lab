@@ -1,0 +1,7 @@
+[Unit]
+Description=Run health-check.py and record the result
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/health-check.py
+StandardOutput=append:/var/log/health-check.json

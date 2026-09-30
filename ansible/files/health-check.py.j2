@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Health-check tool, deployed and scheduled by Ansible (operational-baseline.yml).
+
+Reports disk, memory, load and the status of the services this host is expected
+to be running, as JSON — meant to be read by a human troubleshooting the host or
+piped into something else that alerts on it. Every field is read live from the
+system at run time; nothing here is hardcoded per host.
+"""
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+EXPECTED_SERVICES = {{ expected_services | to_json }}
+
+
+def disk():
+    total, used, free = shutil.disk_usage("/")
+    return {
+        "total_gb": round(total / 1e9, 2),
+        "used_gb": round(used / 1e9, 2),
+        "free_gb": round(free / 1e9, 2),
+        "used_pct": round(used / total * 100, 1),
+    }
+
+
+def memory():
+    info = {}
+    with open("/proc/meminfo", encoding="utf-8") as f:
+        for line in f:
+            key, value = line.split(":", 1)
+            info[key.strip()] = int(value.strip().split()[0])  # kB
+    total_kb = info.get("MemTotal", 0)
+    free_kb = info.get("MemAvailable", info.get("MemFree", 0))
+    used_kb = total_kb - free_kb
+    return {
+        "total_mb": round(total_kb / 1024, 1),
+        "used_mb": round(used_kb / 1024, 1),
+        "free_mb": round(free_kb / 1024, 1),
+        "used_pct": round(used_kb / total_kb * 100, 1) if total_kb else None,
+    }
+
+
+def load_average():
+    one, five, fifteen = os.getloadavg()
+    return {"1min": round(one, 2), "5min": round(five, 2), "15min": round(fifteen, 2)}
+
+
+def service_status(name):
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return f"unknown ({e})"
+
+
+def main():
+    report = {
+        "hostname": socket.gethostname(),
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "disk": disk(),
+        "memory": memory(),
+        "load": load_average(),
+        "services": {name: service_status(name) for name in EXPECTED_SERVICES},
+    }
+
+    # A stopped/failed expected service is the one thing worth a nonzero exit
+    # code for, so this can be wired into cron/systemd alerting later without
+    # having to parse the JSON to find out something's wrong.
+    unhealthy = [n for n, s in report["services"].items() if s != "active"]
+    report["healthy"] = not unhealthy
+    if unhealthy:
+        report["unhealthy_services"] = unhealthy
+
+    print(json.dumps(report, indent=2))
+    return 1 if unhealthy else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

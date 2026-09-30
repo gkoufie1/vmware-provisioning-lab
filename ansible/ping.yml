@@ -1,0 +1,11 @@
+---
+- name: Confirm Ansible can reach and execute on the managed VM
+  hosts: managed
+  gather_facts: true
+  tasks:
+    - name: Ping
+      ansible.builtin.ping:
+
+    - name: Show what Ansible learned about the host
+      ansible.builtin.debug:
+        msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} on {{ ansible_architecture }}, kernel {{ ansible_kernel }}"
