@@ -15,6 +15,10 @@ verification, not just "task completed."
 **What this is not:** a vCenter environment. That distinction turned out to matter a
 lot — see [Findings](#findings-the-real-material-here) below.
 
+> **Monitoring drill 001:** target committed before running it — detection time
+> ≤ 6 minutes for a stopped `node_exporter`. **Measured: 4m 23s. Met.** Full
+> results: [`docs/monitoring-drill-001-results.md`](docs/monitoring-drill-001-results.md).
+
 ## Goal
 
 Get real, verifiable VMware administration experience — install ESXi, manage it,
