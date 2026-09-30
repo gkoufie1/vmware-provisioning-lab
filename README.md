@@ -195,6 +195,8 @@ software, not `photon-template`, so there's no SSH hop for it):
 
 **View it:** `http://<ansible-control-ip>:3000`, login `admin` / `admin`.
 
+![The provisioned dashboard: node up/down, CPU, memory, disk, and load average — real, live data, not a mockup](screenshots/grafana-dashboard.png)
+
 **Caveats, stated plainly:**
 - **Grafana's rpm checksum is self-recorded, not independently cross-checked** —
   GitHub's release for this asset didn't publish a separate checksums file the
